@@ -22,9 +22,11 @@ class SignboardExtraction(BaseModel):
     phone: Optional[str] = Field(None, description="정규화된 전화번호")
     industry: Optional[str] = Field(None, description="업종/업태 키워드")
     address: Optional[str] = Field(None, description="주소 조각")
-    extra_keywords: List[str] = Field(default_factory=list, description="기타 키워드")
+    extra_keywords: List[str] = Field(
+        default_factory=list,
+        description="기타 키워드(최대 5개 권장)"
+    )
     confidence: ConfidenceScores = Field(default_factory=ConfidenceScores)
-    raw_text: str = Field(default="", description="이미지 전체 OCR 텍스트")
 
     @field_validator("business_name", "phone", "industry", "address", mode="before")
     @classmethod
@@ -33,6 +35,36 @@ class SignboardExtraction(BaseModel):
         if isinstance(v, str) and v.strip() == "":
             return None
         return v
+
+    @field_validator("extra_keywords", mode="before")
+    @classmethod
+    def normalize_keywords(cls, v):
+        """키워드 개수 제한 및 공백 제거"""
+        if v is None:
+            return []
+
+        if not isinstance(v, list):
+            return []
+
+        cleaned = []
+        seen = set()
+
+        for item in v:
+            if not isinstance(item, str):
+                continue
+
+            item = item.strip()
+            if not item:
+                continue
+
+            if item not in seen:
+                cleaned.append(item)
+                seen.add(item)
+
+            if len(cleaned) >= 5:
+                break
+
+        return cleaned
 
     def is_extractable(self) -> bool:
         """최소한 상호명이라도 추출되었는지 확인합니다."""

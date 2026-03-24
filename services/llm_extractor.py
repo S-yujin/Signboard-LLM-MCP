@@ -1,13 +1,17 @@
 """
 services/llm_extractor.py
 [Step 1 — LLM]
-간판 이미지를 GPT-4o Vision에 보내 상호명/전화번호/업종/주소를 JSON으로 추출합니다.
+간판 이미지를 Gemini Vision에 보내 상호명/전화번호/업종/주소를 JSON으로 추출합니다.
+google-genai 패키지 사용 (구 google-generativeai 대체)
 """
-from openai import OpenAI
+from pathlib import Path
+
+import httpx
+from google import genai
+from google.genai import types
 
 from config import settings
 from schemas.extraction_schema import SignboardExtraction
-from services.image_service import load_image_block
 from utils.json_utils import safe_parse_json
 from utils.phone_utils import normalize_phone
 from utils.logging_utils import get_logger
@@ -16,31 +20,31 @@ logger = get_logger(__name__)
 
 
 def _load_prompt() -> str:
-    """prompts/extraction_prompt.txt를 읽어 반환합니다."""
     prompt_path = settings.PROMPTS_DIR / "extraction_prompt.txt"
     if not prompt_path.exists():
         raise FileNotFoundError(f"프롬프트 파일을 찾을 수 없습니다: {prompt_path}")
     return prompt_path.read_text(encoding="utf-8")
 
 
-def _to_openai_image_block(image_block: dict) -> dict:
-    """
-    image_service.load_image_block() 반환값을 OpenAI content 형식으로 변환합니다.
+def _load_image_part(image_source: str) -> tuple[bytes, str]:
+    """이미지를 bytes와 mime_type으로 반환합니다."""
+    src = str(image_source)
+    if src.startswith(("http://", "https://")):
+        logger.info("[LLM] URL 이미지 다운로드: %s", src)
+        resp = httpx.get(src, timeout=15)
+        resp.raise_for_status()
+        mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+        return resp.content, mime
 
-    Anthropic 형식:
-        {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
-        {"type": "image", "source": {"type": "url", "url": "..."}}
+    path = Path(src)
+    if not path.exists():
+        raise FileNotFoundError(f"이미지 파일을 찾을 수 없습니다: {path}")
 
-    OpenAI 형식:
-        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
-        {"type": "image_url", "image_url": {"url": "https://..."}}
-    """
-    source = image_block["source"]
-    if source["type"] == "url":
-        return {"type": "image_url", "image_url": {"url": source["url"]}}
-    else:
-        data_url = f"data:{source['media_type']};base64,{source['data']}"
-        return {"type": "image_url", "image_url": {"url": data_url}}
+    ext_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}
+    mime = ext_map.get(path.suffix.lower(), "image/jpeg")
+    logger.info("[LLM] 로컬 이미지 로드: %s (%s)", path.name, mime)
+    return path.read_bytes(), mime
 
 
 def extract_from_signboard(image_source: str) -> SignboardExtraction:
@@ -51,32 +55,28 @@ def extract_from_signboard(image_source: str) -> SignboardExtraction:
         image_source: 로컬 이미지 경로 또는 공개 URL
 
     Returns:
-        SignboardExtraction: 추출된 필드와 신뢰도 점수
+        SignboardExtraction
     """
     logger.info("[LLM] 간판 이미지 분석 시작: %s", image_source)
 
-    client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
     system_prompt = _load_prompt()
+    image_bytes, mime_type = _load_image_part(image_source)
 
-    raw_block = load_image_block(image_source)
-    openai_image = _to_openai_image_block(raw_block)
-
-    response = client.chat.completions.create(
-        model=settings.LLM_MODEL,
-        max_tokens=settings.OPENAI_MAX_TOKENS,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    openai_image,
-                    {"type": "text", "text": "이 간판 이미지에서 사업자 정보를 추출해주세요."},
-                ],
-            },
+    response = client.models.generate_content(
+        model=settings.GEMINI_MODEL,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            "이 간판 이미지에서 사업자 정보를 추출해주세요.",
         ],
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            max_output_tokens=settings.GEMINI_MAX_TOKENS,
+            temperature=0.1,
+        ),
     )
 
-    raw_text = response.choices[0].message.content or ""
+    raw_text = response.text or ""
     logger.debug("[LLM] 원시 응답: %s", raw_text[:300])
 
     parsed = safe_parse_json(raw_text)
