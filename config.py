@@ -12,18 +12,19 @@ load_dotenv(Path(__file__).parent / ".env")
 class Settings:
     # ── Google Gemini ─────────────────────────────────
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = "gemini-2.5-flash-lite"          # 무료 티어 Vision 지원
+    GEMINI_MODEL: str = "gemini-2.5-flash-lite"
     GEMINI_MAX_TOKENS: int = 1024
 
-    # ── 국세청 사업자정보 API ──────────────────────────
-    NTS_API_BASE: str = "https://api.odcloud.kr/api/nts-businessman/v1"
-    NTS_SERVICE_KEY: str = os.getenv("NTS_SERVICE_KEY", "")
+    # ── 비즈노 API (후보 검색) ────────────────────────
+    # 가입: https://api.bizno.net/join
+    # 무료: 1일 200건 / 상호명·사업자번호 검색 가능
+    BIZNO_API_KEY: str = os.getenv("BIZNO_API_KEY", "")
+    BIZNO_API_URL: str = "https://api.bizno.net/api/articles"   # GET ?query=&key=
 
-    # ── 사업자 검색 API ───────────────────────────────
-    BUSINESS_SEARCH_API_URL: str = os.getenv(
-        "BUSINESS_SEARCH_API_URL", "https://mock-search-api.example.com/v1"
-    )
-    BUSINESS_SEARCH_API_KEY: str = os.getenv("BUSINESS_SEARCH_API_KEY", "")
+    # ── 국세청 API (최종 상태 검증) ───────────────────
+    # 발급: https://www.data.go.kr → '사업자등록정보 진위확인 및 상태조회'
+    NTS_SERVICE_KEY: str = os.getenv("NTS_SERVICE_KEY", "")
+    NTS_API_BASE: str = "https://api.odcloud.kr/api/nts-businessman/v1"
 
     # ── 일반 ──────────────────────────────────────────
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
