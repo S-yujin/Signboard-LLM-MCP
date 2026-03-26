@@ -19,7 +19,7 @@ class Settings:
     # 가입: https://api.bizno.net/join
     # 무료: 1일 200건 / 상호명·사업자번호 검색 가능
     BIZNO_API_KEY: str = os.getenv("BIZNO_API_KEY", "")
-    BIZNO_API_URL: str = "https://api.bizno.net/api/articles"   # GET ?query=&key=
+    BIZNO_API_URL: str = "https://bizno.net/api/fapi"   # GET ?key=&q=&gb=3&type=json
 
     # ── 국세청 API (최종 상태 검증) ───────────────────
     # 발급: https://www.data.go.kr → '사업자등록정보 진위확인 및 상태조회'
