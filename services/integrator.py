@@ -29,6 +29,48 @@ _STATUS_NAME_MAP: dict[str, BusinessStatus] = {
 }
 
 
+def _compute_confidence(
+    candidate_name: str,
+    extracted_name: str,
+    extracted_address: str | None,
+    business_status: BusinessStatus,
+) -> float:
+    """
+    LLM이 산정한 점수 대신 Python에서 직접 계산합니다.
+
+    기준:
+      +0.5  상호명 완전 일치 (공백·대소문자 무시)
+      +0.3  상호명 부분 포함
+      +0.2  지점/지역명 일치 (추출 주소가 후보명 안에 있거나 그 반대)
+      +0.3  국세청 계속사업자 확인
+      최대 1.0으로 클램핑
+    """
+    score = 0.0
+
+    c = candidate_name.lower().replace(" ", "")
+    e = extracted_name.lower().replace(" ", "")
+
+    if c == e:
+        score += 0.5
+    elif e in c or c in e:
+        score += 0.3
+
+    # 지점/지역명 매칭: 추출 주소의 단어가 후보명에 포함되면 가산
+    if extracted_address:
+        # 주소에서 의미 있는 토큰 추출 (2글자 이상)
+        import re
+        tokens = re.findall(r"[가-힣a-zA-Z]{2,}", extracted_address)
+        for token in tokens:
+            if token.lower() in candidate_name.lower():
+                score += 0.2
+                break  # 한 번만 가산
+
+    if business_status == BusinessStatus.ACTIVE:
+        score += 0.3
+
+    return round(min(score, 1.0), 2)
+
+
 def build_pipeline_result(
     image_source: str,
     extraction: SignboardExtraction,
@@ -59,7 +101,7 @@ def build_pipeline_result(
     candidates: list[BusinessCandidate] = []
     for item in agent_output.get("candidates", []):
         try:
-            candidate = _parse_candidate(item)
+            candidate = _parse_candidate(item, extraction)
             candidates.append(candidate)
         except Exception as e:
             logger.warning("후보 파싱 실패 (건너뜀): %s — %s", item, e)
@@ -70,13 +112,20 @@ def build_pipeline_result(
     raw_best = agent_output.get("best_match")
     if raw_best:
         try:
-            best_match = _parse_candidate(raw_best)
+            best_match = _parse_candidate(raw_best, extraction)
+            # candidates에서 같은 등록번호로 교체 (재계산된 점수 반영)
+            regno = best_match.registration_number
+            matched = next((c for c in candidates if c.registration_number == regno), None)
+            if matched:
+                best_match = matched
         except Exception:
-            # candidates 중 최고 confidence_score를 best_match로 사용
-            if candidates:
-                best_match = max(candidates, key=lambda c: c.confidence_score)
-    elif candidates:
-        best_match = max(candidates, key=lambda c: c.confidence_score)
+            pass
+
+    # best_match를 candidates 중 최고 confidence_score로 결정
+    if candidates:
+        best_by_score = max(candidates, key=lambda c: c.confidence_score)
+        if best_match is None or best_by_score.confidence_score > best_match.confidence_score:
+            best_match = best_by_score
 
     logger.info(
         "[통합] status=%s / 후보=%d건 / best=%s",
@@ -101,7 +150,7 @@ def build_pipeline_result(
 # 내부 헬퍼
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _parse_candidate(item: dict) -> BusinessCandidate:
+def _parse_candidate(item: dict, extraction: SignboardExtraction | None = None) -> BusinessCandidate:
     """딕셔너리에서 BusinessCandidate Pydantic 모델을 생성합니다."""
     # business_status 정규화
     raw_stt_name = item.get("business_status", "unknown")
@@ -112,9 +161,22 @@ def _parse_candidate(item: dict) -> BusinessCandidate:
         or BusinessStatus.UNKNOWN
     )
 
+    candidate_name = str(item.get("business_name", ""))
+
+    # confidence_score: LLM 점수 대신 Python에서 직접 재계산
+    if extraction and extraction.business_name:
+        confidence_score = _compute_confidence(
+            candidate_name=candidate_name,
+            extracted_name=extraction.business_name,
+            extracted_address=extraction.address,
+            business_status=business_status,
+        )
+    else:
+        confidence_score = float(item.get("confidence_score", 0.0))
+
     return BusinessCandidate(
         registration_number=str(item.get("registration_number", "")),
-        business_name=str(item.get("business_name", "")),
+        business_name=candidate_name,
         representative=item.get("representative"),
         address=item.get("address"),
         industry=item.get("industry"),
@@ -122,6 +184,6 @@ def _parse_candidate(item: dict) -> BusinessCandidate:
         business_status=business_status,
         tax_type=item.get("tax_type"),
         status_verified=bool(item.get("status_verified", False)),
-        confidence_score=float(item.get("confidence_score", 0.0)),
+        confidence_score=confidence_score,
         source=str(item.get("source", "unknown")),
     )

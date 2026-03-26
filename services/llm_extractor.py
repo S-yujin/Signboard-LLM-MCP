@@ -71,12 +71,22 @@ def extract_from_signboard(image_source: str) -> SignboardExtraction:
         ],
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
-            max_output_tokens=settings.GEMINI_MAX_TOKENS,
+            max_output_tokens=2048,   # 1024 → 2048 (잘림 방지)
             temperature=0.1,
         ),
     )
 
     raw_text = response.text or ""
+
+    # 응답이 토큰 한도로 잘렸는지 감지
+    finish_reason = None
+    try:
+        finish_reason = response.candidates[0].finish_reason
+    except (AttributeError, IndexError):
+        pass
+    if str(finish_reason) in ("MAX_TOKENS", "2"):  # 2 = MAX_TOKENS enum 값
+        logger.warning("[LLM] 응답이 토큰 한도로 잘렸습니다 (finish_reason=%s). 복구 시도...", finish_reason)
+
     logger.debug("[LLM] 원시 응답: %s", raw_text[:300])
 
     parsed = safe_parse_json(raw_text)

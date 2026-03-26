@@ -128,12 +128,17 @@ def _bizno_search_candidates(query: str, area: str | None = None) -> dict:
         resp.raise_for_status()
         data = resp.json()
 
+        # 응답 자체가 None이거나 dict가 아닌 경우 방어
+        if not isinstance(data, dict):
+            logger.warning("[MCP/비즈노] 응답이 dict가 아님: %s", type(data))
+            return {"error": "잘못된 응답 형식", "candidates": []}
+
         if data.get("resultCode") != 0:
             logger.warning("[MCP/비즈노] 결과코드 오류: %s", data.get("resultMsg"))
             return {"error": data.get("resultMsg", "알 수 없는 오류"), "candidates": []}
 
-        raw_items = data.get("items", [])
-        candidates = [_normalize_bizno_item(item) for item in raw_items]
+        raw_items = data.get("items") or []   # None → []
+        candidates = [_normalize_bizno_item(item) for item in raw_items if isinstance(item, dict)]
 
         logger.info("[MCP/비즈노] 후보 %d건 / 전체 %s건", len(candidates), data.get("totalCount"))
         return {
@@ -149,16 +154,16 @@ def _bizno_search_candidates(query: str, area: str | None = None) -> dict:
 
 def _normalize_bizno_item(item: dict) -> dict:
     """비즈노 응답 항목 → 내부 통일 포맷"""
-    raw_bno = str(item.get("bno", "")).replace("-", "")
+    raw_bno = str(item.get("bno") or "").replace("-", "")
     return {
         "registration_number": raw_bno,
-        "business_name":       item.get("company", ""),
-        "business_status":     item.get("bstt", "unknown"),
-        "status_code":         item.get("bsttcd", ""),
-        "tax_type":            item.get("taxtype", ""),
-        "tax_type_cd":         item.get("TaxTypeCd", ""),
-        "corporation_number":  item.get("cno", ""),
-        "end_date":            item.get("EndDt", ""),
+        "business_name":       item.get("company") or "",
+        "business_status":     item.get("bstt") or "unknown",
+        "status_code":         item.get("bsttcd") or "",
+        "tax_type":            item.get("taxtype") or "",
+        "tax_type_cd":         item.get("TaxTypeCd") or "",
+        "corporation_number":  item.get("cno") or "",
+        "end_date":            item.get("EndDt") or "",
         "source":              "bizno_api",
     }
 

@@ -36,8 +36,55 @@ def safe_parse_json(text: str) -> Optional[dict]:
     try:
         return json.loads(json_str)
     except json.JSONDecodeError as e:
+        # 응답이 잘린 경우 복구 시도: 열린 따옴표·괄호를 닫아줌
+        recovered = _recover_truncated_json(cleaned[start:])
+        if recovered:
+            try:
+                return json.loads(recovered)
+            except json.JSONDecodeError:
+                pass
         logger.error("JSON 파싱 오류: %s — 원본(앞 200자): %s", e, json_str[:200])
         return None
+
+
+def _recover_truncated_json(text: str) -> Optional[str]:
+    """
+    토큰 한도로 잘린 JSON을 복구합니다.
+    마지막으로 완전히 파싱된 key-value 쌍까지만 남기고 괄호를 닫습니다.
+
+    예) '{"business_name": "CAFE 051", "phone": "1577-7978", "industry": "'
+        → '{"business_name": "CAFE 051", "phone": "1577-7978"}'
+    """
+    # 마지막 쉼표 뒤 불완전한 부분을 제거하고 닫기
+    # 전략: 뒤에서부터 '}' 또는 완전한 값 뒤 쉼표를 찾아 거기서 닫음
+    candidates = []
+
+    # 시도 1: 마지막 완전한 쉼표 위치에서 자르고 닫기
+    for i in range(len(text) - 1, -1, -1):
+        if text[i] == ',':
+            attempt = text[:i] + "}"
+            try:
+                json.loads(attempt)
+                candidates.append(attempt)
+                break
+            except json.JSONDecodeError:
+                continue
+
+    # 시도 2: 마지막 완전한 값(문자열 닫힘 or 숫자) 뒤에서 닫기
+    # null 필드를 채워서 완성하는 방식
+    attempt2 = text.rstrip().rstrip(',').rstrip()
+    # 열린 문자열이 있으면 닫기
+    quote_count = attempt2.count('"') - attempt2.count('\\"')
+    if quote_count % 2 == 1:
+        attempt2 += '"'
+    attempt2 += "}"
+    try:
+        json.loads(attempt2)
+        candidates.append(attempt2)
+    except json.JSONDecodeError:
+        pass
+
+    return candidates[0] if candidates else None
 
 
 def pretty_json(obj: Any, ensure_ascii: bool = False) -> str:
