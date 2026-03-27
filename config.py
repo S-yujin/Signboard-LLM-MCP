@@ -12,7 +12,7 @@ load_dotenv(Path(__file__).parent / ".env")
 class Settings:
     # ── Google Gemini ─────────────────────────────────
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.1-flash-lite-preview"
     GEMINI_MAX_TOKENS: int = 1024
 
     # ── 비즈노 API (후보 검색) ────────────────────────
