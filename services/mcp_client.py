@@ -92,15 +92,16 @@ def _bizno_search_candidates(query: str, area: str | None = None) -> dict:
     """
     비즈노 API로 상호명 검색하여 사업자 후보 목록을 반환합니다.
 
+    Fallback 전략 (Python 레벨 이중 방어):
+        에이전트가 단일 쿼리만 시도하다 멈춰도 mcp_client 자체에서
+        generate_query_variants()의 변형 쿼리를 순서대로 자동 재시도합니다.
+        에이전트 레벨 fallback + Python 레벨 fallback의 이중 구조로 검색 성공률 향상.
+
     응답 필드:
         company   : 상호명
         bno       : 사업자등록번호 (하이픈 포함, 예: 123-45-67890)
-        cno       : 법인등록번호
         bstt      : 사업자상태 (계속사업자 / 휴업자 / 폐업자)
-        bsttcd    : 상태코드
         taxtype   : 과세유형
-        TaxTypeCd : 과세유형코드
-        EndDt     : 폐업일
     """
     logger.info("[MCP/비즈노] 검색어: %s / 지역: %s", query, area)
 
@@ -108,27 +109,52 @@ def _bizno_search_candidates(query: str, area: str | None = None) -> dict:
         logger.debug("[MCP/비즈노] API 키 없음 — mock 반환")
         return _bizno_mock(query)
 
+    # fallback 쿼리 목록 생성
+    from services.verifier import generate_query_variants
+    queries_to_try = generate_query_variants(query)
+
+    last_error: str | None = None
+    for attempt_query in queries_to_try:
+        result = _bizno_single_request(attempt_query, area)
+
+        if "error" in result:
+            last_error = result["error"]
+            continue
+
+        candidates = result.get("candidates", [])
+        if candidates:
+            if attempt_query != query:
+                logger.info("[MCP/비즈노] fallback 성공: '%s' → '%s' (%d건)",
+                            query, attempt_query, len(candidates))
+                result["fallback_query"] = attempt_query
+            return result
+
+        logger.info("[MCP/비즈노] 0건 — 다음 쿼리 시도: '%s'", attempt_query)
+
+    logger.warning("[MCP/비즈노] 모든 fallback 쿼리 소진 — 후보 없음 (원본: '%s')", query)
+    if last_error:
+        return {"error": last_error, "candidates": [], "source": "bizno_api"}
+    return {"candidates": [], "total": 0, "source": "bizno_api", "fallback_exhausted": True}
+
+
+def _bizno_single_request(query: str, area: str | None = None) -> dict:
+    """비즈노 API 단건 요청."""
     params = {
         "key":     settings.BIZNO_API_KEY,
         "q":       query,
-        "gb":      "3",          # 3: 상호명 검색
+        "gb":      "3",
         "type":    "json",
-        "status":  "Y",          # 국세청 실시간 상태 조회 포함
-        "pagecnt": "5",          # 최대 5건
+        "status":  "Y",
+        "pagecnt": "5",
     }
     if area:
         params["area"] = area
 
     try:
-        resp = httpx.get(
-            settings.BIZNO_API_URL,
-            params=params,
-            timeout=10,
-        )
+        resp = httpx.get(settings.BIZNO_API_URL, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
 
-        # 응답 자체가 None이거나 dict가 아닌 경우 방어
         if not isinstance(data, dict):
             logger.warning("[MCP/비즈노] 응답이 dict가 아님: %s", type(data))
             return {"error": "잘못된 응답 형식", "candidates": []}
@@ -137,15 +163,11 @@ def _bizno_search_candidates(query: str, area: str | None = None) -> dict:
             logger.warning("[MCP/비즈노] 결과코드 오류: %s", data.get("resultMsg"))
             return {"error": data.get("resultMsg", "알 수 없는 오류"), "candidates": []}
 
-        raw_items = data.get("items") or []   # None → []
+        raw_items = data.get("items") or []
         candidates = [_normalize_bizno_item(item) for item in raw_items if isinstance(item, dict)]
 
         logger.info("[MCP/비즈노] 후보 %d건 / 전체 %s건", len(candidates), data.get("totalCount"))
-        return {
-            "candidates":   candidates,
-            "total":        data.get("totalCount", len(candidates)),
-            "source":       "bizno_api",
-        }
+        return {"candidates": candidates, "total": data.get("totalCount", len(candidates)), "source": "bizno_api"}
 
     except httpx.HTTPError as e:
         logger.error("[MCP/비즈노] API 오류: %s", e)

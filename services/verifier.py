@@ -68,31 +68,64 @@ def generate_query_variants(name: str) -> list[str]:
     """
     상호명 검색 실패에 대비한 쿼리 후보 리스트를 생성합니다.
 
-    변형 순서:
-      1. 원본 그대로
-      2. 영문 단어 → 한글 음역  (예: "CAFE 051" → "카페 051")
-      3. 공백 제거한 한글 버전  (예: "카페 051" → "카페051")
-      4. 공백 제거한 원본       (예: "CAFE 051" → "CAFE051")
+    변형 단계 (순서대로 시도, 최대 7단계):
+      1. 원본 그대로                          "CAFE 051 서면롯데점"
+      2. 지점명 제거                          "CAFE 051"
+      3. 영문 → 한글 음역                     "카페 051"
+      4. 공백 제거 (한글)                     "카페051"
+      5. 공백 제거 (원본)                     "CAFE051"
+      6. 숫자 제거한 핵심 브랜드명 (2자 이상)  "카페"
+      7. 첫 단어(토큰)만                      "CAFE"
+
+    Bizno는 부분일치 검색을 지원하므로 짧을수록 더 많은 후보를 반환합니다.
     """
+    import re
+
     variants: list[str] = [name]
 
-    translated = name
+    # ── Step 2: 지점명 제거 ─────────────────────────────────────────────────
+    branch_removed = re.sub(
+        r"\s*\S*(점|호점|지점|본점|직영점|가맹점|분점|센터|지사)$",
+        "", name
+    ).strip()
+    if branch_removed and branch_removed != name:
+        variants.append(branch_removed)
+    else:
+        branch_removed = name
+
+    # ── Step 3: 영문 → 한글 음역 ────────────────────────────────────────────
+    translated = branch_removed
     for en, ko in _EN_TO_KO.items():
         translated = translated.replace(en, ko)
+    if translated != branch_removed:
+        variants.append(translated)
 
-    if translated != name:
-        variants.append(translated)                    # "카페 051"
-        variants.append(translated.replace(" ", ""))   # "카페051"
+    # ── Step 4: 공백 제거 (한글) ────────────────────────────────────────────
+    translated_nospace = translated.replace(" ", "")
+    if translated_nospace not in variants:
+        variants.append(translated_nospace)
 
-    no_space = name.replace(" ", "")
-    if no_space not in variants:
-        variants.append(no_space)                      # "CAFE051"
+    # ── Step 5: 공백 제거 (원본) ────────────────────────────────────────────
+    nospace = branch_removed.replace(" ", "")
+    if nospace not in variants:
+        variants.append(nospace)
 
-    # 중복 제거, 순서 유지
+    # ── Step 6: 숫자 제거한 브랜드명 (2자 이상이어야 유효) ─────────────────
+    no_digits = re.sub(r"\d+", "", translated_nospace).strip()
+    if len(no_digits) >= 2 and no_digits not in variants:
+        variants.append(no_digits)
+
+    # ── Step 7: 첫 토큰만 ───────────────────────────────────────────────────
+    tokens = branch_removed.split()
+    if tokens and tokens[0] not in variants and len(tokens[0]) >= 2:
+        variants.append(tokens[0])
+
+    # 중복 제거, 빈 문자열 제외, 순서 유지
     seen: set[str] = set()
     result: list[str] = []
     for v in variants:
-        if v not in seen:
+        v = v.strip()
+        if v and v not in seen:
             seen.add(v)
             result.append(v)
     return result
@@ -100,14 +133,18 @@ def generate_query_variants(name: str) -> list[str]:
 _AGENT_SYSTEM_PROMPT = """당신은 사업자 정보 검증 전문 에이전트입니다.
 간판 분석 결과를 바탕으로 반드시 아래 두 단계를 순서대로 수행하세요.
 
-[Step 1] bizno_search_candidates 호출
-  - 추출된 상호명(business_name)으로 검색합니다.
-  - area 파라미터는 사용하지 마세요. 지역 필터링은 후처리에서 처리합니다.
-  - 결과가 없으면 아래 순서로 쿼리를 변형하여 재검색합니다.
-    1) 영문 단어를 한글로 음역: "CAFE" → "카페", "BEAUTY" → "뷰티" 등
-    2) 공백 제거: "카페 051" → "카페051"
-    3) 상호명 축약: "청담부동산공인중개사무소" → "청담부동산"
-    예) "CAFE 051" 검색 실패 → "카페 051" 재시도 → "카페051" 재시도
+[Step 1] bizno_search_candidates 호출 — Fallback 검색 전략
+  후보가 확보될 때까지 아래 순서로 쿼리를 변형하며 최대 5회 재시도합니다.
+  결과가 0건이면 즉시 다음 단계로 넘어가고, 1건 이상이면 Step 2로 진행합니다.
+
+  시도 순서 (variants_hint에 제공된 리스트를 순서대로 사용):
+    1단계) 원본 상호명 그대로
+    2단계) 지점명 제거  ("서면롯데점", "1호점", "본점" 등 제거)
+    3단계) 영문 → 한글 음역  ("CAFE" → "카페", "CHICKEN" → "치킨")
+    4단계) 공백 제거  ("카페 051" → "카페051")
+    5단계) 핵심 브랜드명만  (숫자·지점명 제거 후 핵심어)
+
+  ※ area 파라미터는 사용하지 마세요. 지역 필터링은 후처리에서 처리합니다.
 
 [Step 2] nts_verify_business_status 호출
   - Step 1 결과 중 상호명이 유사한 후보의 bno(사업자등록번호)에서 하이픈을 제거하여 전달합니다.
@@ -144,11 +181,12 @@ confidence_score 산정 기준 (0.0 ~ 1.0):
   - 상호명 부분 일치: +0.3
   - 지역 일치: +0.2
   - 국세청 계속사업자 확인: +0.3
+  ※ 실제 점수는 Python integrator에서 재계산되므로 근사값을 넣어도 됩니다.
 
 status 기준:
   verified  — 비즈노 후보 확보 + 국세청 상태 확인 완료
   partial   — 비즈노 후보는 있으나 국세청 검증 불완전
-  not_found — 후보를 찾지 못함
+  not_found — 5단계 fallback을 모두 시도했음에도 후보를 찾지 못함
 """
 
 

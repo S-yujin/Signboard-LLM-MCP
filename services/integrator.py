@@ -34,39 +34,70 @@ def _compute_confidence(
     extracted_name: str,
     extracted_address: str | None,
     business_status: BusinessStatus,
+    status_verified: bool = False,
 ) -> float:
     """
-    LLM이 산정한 점수 대신 Python에서 직접 계산합니다.
+    conf_MCP 계산: 외부 API(Bizno + 국세청) 검증 결과를 수치화합니다.
 
-    기준:
-      +0.5  상호명 완전 일치 (공백·대소문자 무시)
-      +0.3  상호명 부분 포함
-      +0.2  지점/지역명 일치 (추출 주소가 후보명 안에 있거나 그 반대)
-      +0.3  국세청 계속사업자 확인
-      최대 1.0으로 클램핑
+    논문 수식에서 conf_MCP 항에 해당하며, 다음 기준으로 산정됩니다:
+
+    [상호명 일치도]  최대 0.50
+      +0.50  정규화 후 완전 일치  (_normalize_name 적용 — 한글↔영문 동의어 포함)
+      +0.35  한쪽이 다른 쪽을 포함
+      +0.20  정규화 Levenshtein 유사도 ≥ 0.6
+
+    [국세청 검증 보너스]  최대 0.40
+      +0.40  국세청 API verified + 계속사업자   ← 외부 Ground Truth 확인
+      +0.20  국세청 API verified + 휴/폐업
+      +0.10  verified=False이지만 Bizno 기준 계속사업자
+
+    [지역 일치]  최대 0.10
+      +0.10  추출 주소의 토큰이 후보명에 포함
+
+    총합 최대 1.0으로 클램핑.
+
+    설계 의도:
+      - 국세청 verified + 계속사업자 조합에 큰 점수(0.40)를 부여해
+        MCP 연동의 실질적 가치를 conf_MCP에 반영
+      - 단순 이름 매칭만으로는 0.5를 넘기 어려워 외부 검증 없이
+        높은 신뢰도가 부여되는 것을 방지 (hallucination 억제 효과)
     """
+    import re
+    from services.confidence import _normalize_name, levenshtein_similarity
+
     score = 0.0
 
-    c = candidate_name.lower().replace(" ", "")
-    e = extracted_name.lower().replace(" ", "")
+    # ── 상호명 일치도 (최대 0.50) ─────────────────────────────────────────────
+    norm_c = _normalize_name(candidate_name)
+    norm_e = _normalize_name(extracted_name)
 
-    if c == e:
-        score += 0.5
-    elif e in c or c in e:
-        score += 0.3
+    if norm_c and norm_e:
+        if norm_c == norm_e:
+            score += 0.50                          # 완전 일치
+        elif norm_e in norm_c or norm_c in norm_e:
+            score += 0.35                          # 포함 관계
+        else:
+            sim = levenshtein_similarity(extracted_name, candidate_name)
+            if sim >= 0.6:
+                score += 0.20                      # 유사도 ≥ 0.6
 
-    # 지점/지역명 매칭: 추출 주소의 단어가 후보명에 포함되면 가산
+    # ── 국세청 검증 보너스 (최대 0.40) ───────────────────────────────────────
+    if status_verified:
+        if business_status == BusinessStatus.ACTIVE:
+            score += 0.40                          # verified + 계속사업자
+        else:
+            score += 0.20                          # verified + 휴/폐업
+    else:
+        if business_status == BusinessStatus.ACTIVE:
+            score += 0.10                          # Bizno 기준 계속사업자만
+
+    # ── 지역 일치 (최대 0.10) ────────────────────────────────────────────────
     if extracted_address:
-        # 주소에서 의미 있는 토큰 추출 (2글자 이상)
-        import re
         tokens = re.findall(r"[가-힣a-zA-Z]{2,}", extracted_address)
         for token in tokens:
             if token.lower() in candidate_name.lower():
-                score += 0.2
-                break  # 한 번만 가산
-
-    if business_status == BusinessStatus.ACTIVE:
-        score += 0.3
+                score += 0.10
+                break
 
     return round(min(score, 1.0), 2)
 
@@ -163,13 +194,15 @@ def _parse_candidate(item: dict, extraction: SignboardExtraction | None = None) 
 
     candidate_name = str(item.get("business_name", ""))
 
-    # confidence_score: LLM 점수 대신 Python에서 직접 재계산
+    # confidence_score: LLM 점수 대신 Python에서 직접 재계산 (conf_MCP)
+    status_verified = bool(item.get("status_verified", False))
     if extraction and extraction.business_name:
         confidence_score = _compute_confidence(
             candidate_name=candidate_name,
             extracted_name=extraction.business_name,
             extracted_address=extraction.address,
             business_status=business_status,
+            status_verified=status_verified,
         )
     else:
         confidence_score = float(item.get("confidence_score", 0.0))
