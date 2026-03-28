@@ -26,6 +26,7 @@ from services.llm_extractor import extract_from_signboard
 from services.verifier import run_verification_agent
 from services.integrator import build_pipeline_result
 from services.confidence import ConfidenceInput, compute_confidence
+from services.gps_extractor import extract_gps_coords
 from utils.json_utils import pretty_json, save_json
 from utils.logging_utils import get_logger
 
@@ -76,6 +77,31 @@ def _inject_confidence(result: dict) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# GPS 좌표 추출 (로컬 파일 한정, URL은 EXIF 없음)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extract_gps(source: str) -> tuple[float | None, float | None]:
+    """
+    로컬 이미지 파일에서 EXIF GPS 좌표를 추출합니다.
+
+    URL 입력이거나 파일이 존재하지 않으면 (None, None)을 반환합니다.
+    GPS EXIF가 없는 파일도 (None, None)을 반환하며, 이 경우
+    integrator의 GPS 가산점은 0으로 처리됩니다.
+    """
+    if source.startswith("http://") or source.startswith("https://"):
+        return None, None
+    path = Path(source)
+    if not path.exists():
+        return None, None
+    coords = extract_gps_coords(str(path))
+    if coords:
+        logger.info("[GPS] EXIF 좌표 추출 성공: lat=%.5f, lon=%.5f", coords[0], coords[1])
+        return coords[0], coords[1]
+    logger.debug("[GPS] EXIF 좌표 없음: %s", source)
+    return None, None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 메인 파이프라인
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -85,10 +111,11 @@ def run_pipeline(image_source: str | list[str]) -> dict:
 
     Pipeline:
         Step 1 [LLM]    이미지 → 상호명/전화/업종/주소 JSON 추출
-        Step 2 [MCP]    lookup_business_candidates → 후보 조회 (Bizno.net)
-        Step 3 [MCP]    verify_business_status     → 국세청 상태 검증
-        Step 4 [통합]   PipelineResult 조립
-        Step 5 [신뢰도] confFINAL = w_EXT*conf_EXT + w_LLM*conf_LLM + w_MCP*conf_MCP
+        Step 2 [GPS]    EXIF GPS 좌표 추출 (있을 경우 Layer 3 가산점에 활용)
+        Step 3 [MCP]    lookup_business_candidates → 후보 조회 (Bizno.net)
+        Step 4 [MCP]    verify_business_status     → 국세청 상태 검증
+        Step 5 [통합]   PipelineResult 조립 (GPS 거리 가산점 반영)
+        Step 6 [신뢰도] confFINAL = w_EXT*conf_EXT + w_LLM*conf_LLM + w_MCP*conf_MCP
 
     Args:
         image_source: 로컬 파일 경로 또는 공개 이미지 URL.
@@ -123,16 +150,24 @@ def run_pipeline(image_source: str | list[str]) -> dict:
         )
         return _inject_confidence(result.model_dump(mode="json"))
 
-    # ── Step 2 & 3: MCP 에이전트 ─────────────────────────────────────────────
-    logger.info("[Step 2-3] MCP 에이전트 실행 중...")
+    # ── Step 2: GPS 좌표 추출 ─────────────────────────────────────────────────
+    logger.info("[Step 2] GPS EXIF 추출 중...")
+    gps_lat, gps_lon = _extract_gps(source)
+
+    # ── Step 3 & 4: MCP 에이전트 ─────────────────────────────────────────────
+    logger.info("[Step 3-4] MCP 에이전트 실행 중...")
     agent_output = run_verification_agent(extraction)
 
-    # ── Step 4: 최종 통합 ─────────────────────────────────────────────────────
-    logger.info("[Step 4] 결과 통합 중...")
-    pipeline_result = build_pipeline_result(source, extraction, agent_output)
+    # ── Step 5: 최종 통합 (GPS 가산점 반영) ──────────────────────────────────
+    logger.info("[Step 5] 결과 통합 중...")
+    pipeline_result = build_pipeline_result(
+        source, extraction, agent_output,
+        gps_lat=gps_lat,
+        gps_lon=gps_lon,
+    )
     result = pipeline_result.model_dump(mode="json")
 
-    # ── Step 5: 신뢰도 수식 계산 ──────────────────────────────────────────────
+    # ── Step 6: 신뢰도 수식 계산 ──────────────────────────────────────────────
     result = _inject_confidence(result)
 
     logger.info("=" * 60)
