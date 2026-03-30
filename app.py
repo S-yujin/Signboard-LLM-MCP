@@ -1,19 +1,18 @@
 """
 app.py
 
-간판 분석 → 사업자 검증 파이프라인 진입점
+간판 분석 → 사업자 검증 파이프라인 진입점 (GPS/POI 제거 — 최종 버전)
 
 사용법:
     python app.py <이미지_경로_또는_URL> [--output output.json]
 
-예시:
-    python app.py ./sample_data/test_signboard.jpg
-    python app.py https://example.com/sign.png --output result.json
-
-NOTE:
-    현재 구현은 단일 뷰 이미지 기반으로 동작합니다.
-    다중 뷰(Multiple Views) 기반의 신뢰도 보정은 향후 연구 과제(Future Work)입니다.
-    입력 인터페이스는 List[str] 형태로 설계되어 있어 다중 뷰 확장에 대응 가능합니다.
+파이프라인 단계:
+    Step 1  [LLM]   이미지 → 상호명 / 전화 / 업종 / 주소 JSON 추출
+    Step 2  [MCP]   비즈노 후보 검색 → 국세청 상태 검증
+    Step 3  [통합]  PipelineResult 조립
+    Step 4  [신뢰도] conf_FINAL = w_BRAND*S_brand
+                               + w_BRANCH*S_branch
+                               + w_STATUS*S_status
 """
 
 import argparse
@@ -25,22 +24,16 @@ from schemas.output_schema import PipelineStatus
 from services.llm_extractor import extract_from_signboard
 from services.verifier import run_verification_agent
 from services.integrator import build_pipeline_result
-from services.confidence import ConfidenceInput, compute_confidence
-from services.gps_extractor import extract_gps_coords
+from services.confidence import ConfidenceInputV2, compute_confidence_v2
 from utils.json_utils import pretty_json, save_json
 from utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 속성 완전성 계산
-# ──────────────────────────────────────────────────────────────────────────────
-
 _REQUIRED_FIELDS = ["business_name", "phone", "industry", "address"]
 
+
 def _attribute_completeness(signboard_dict: dict) -> float:
-    """추출된 사업자 속성 중 값이 채워진 필드의 비율을 반환합니다."""
     if not signboard_dict:
         return 0.0
     filled = sum(
@@ -56,49 +49,30 @@ def _attribute_completeness(signboard_dict: dict) -> float:
 
 def _inject_confidence(result: dict) -> dict:
     """
-    pipeline_result dict에 논문 제안 신뢰도 수식(confFINAL)을 계산해 주입합니다.
+    pipeline_result dict에 제안 수식 v2를 계산해 주입합니다.
 
-        confFINAL = w_EXT * conf_EXT + w_LLM * conf_LLM + w_MCP * conf_MCP
-
-    conf_LLM은 Levenshtein 유사도를 시그모이드로 변환한 확률적 융합 점수입니다.
+        conf_FINAL = w_BRAND*S_brand + w_BRANCH*S_branch + w_STATUS*S_status
     """
     sb   = result.get("source_signboard") or {}
     best = result.get("best_match") or {}
 
-    inp = ConfidenceInput(
-        conf_ext=( sb.get("confidence") or {}).get("business_name", 0.0),
-        extracted_name=sb.get("business_name") or "",
-        candidate_name=best.get("business_name") or "",
-        attribute_completeness=_attribute_completeness(sb),
-        conf_mcp=best.get("confidence_score", 0.0),
+    inp = ConfidenceInputV2(
+        extracted_name  = sb.get("business_name") or "",
+        candidate_name  = best.get("business_name") or "",
+        business_status = best.get("business_status") or "unknown",
+        status_verified = bool(best.get("status_verified", False)),
     )
-    result["confidence_scores"] = compute_confidence(inp).as_dict()
+    cv2_result = compute_confidence_v2(inp)
+    result["confidence_scores"] = cv2_result.as_dict()
+
+    # 경고를 최상위 warnings에도 병합
+    top_warnings: list = result.get("warnings") or []
+    for w in cv2_result.warnings:
+        if w not in top_warnings:
+            top_warnings.append(w)
+    result["warnings"] = top_warnings
+
     return result
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# GPS 좌표 추출 (로컬 파일 한정, URL은 EXIF 없음)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _extract_gps(source: str) -> tuple[float | None, float | None]:
-    """
-    로컬 이미지 파일에서 EXIF GPS 좌표를 추출합니다.
-
-    URL 입력이거나 파일이 존재하지 않으면 (None, None)을 반환합니다.
-    GPS EXIF가 없는 파일도 (None, None)을 반환하며, 이 경우
-    integrator의 GPS 가산점은 0으로 처리됩니다.
-    """
-    if source.startswith("http://") or source.startswith("https://"):
-        return None, None
-    path = Path(source)
-    if not path.exists():
-        return None, None
-    coords = extract_gps_coords(str(path))
-    if coords:
-        logger.info("[GPS] EXIF 좌표 추출 성공: lat=%.5f, lon=%.5f", coords[0], coords[1])
-        return coords[0], coords[1]
-    logger.debug("[GPS] EXIF 좌표 없음: %s", source)
-    return None, None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -110,22 +84,11 @@ def run_pipeline(image_source: str | list[str]) -> dict:
     간판 이미지에 대한 전체 파이프라인을 실행합니다.
 
     Pipeline:
-        Step 1 [LLM]    이미지 → 상호명/전화/업종/주소 JSON 추출
-        Step 2 [GPS]    EXIF GPS 좌표 추출 (있을 경우 Layer 3 가산점에 활용)
-        Step 3 [MCP]    lookup_business_candidates → 후보 조회 (Bizno.net)
-        Step 4 [MCP]    verify_business_status     → 국세청 상태 검증
-        Step 5 [통합]   PipelineResult 조립 (GPS 거리 가산점 반영)
-        Step 6 [신뢰도] confFINAL = w_EXT*conf_EXT + w_LLM*conf_LLM + w_MCP*conf_MCP
-
-    Args:
-        image_source: 로컬 파일 경로 또는 공개 이미지 URL.
-                      List[str]를 전달할 경우 첫 번째 요소를 단일 이미지로 처리합니다.
-                      (다중 뷰 통합은 Future Work)
-
-    Returns:
-        PipelineResult + confidence_scores 가 포함된 dict
+        Step 1  [LLM]   이미지 → 상호명/전화/업종/주소 JSON 추출
+        Step 2  [MCP]   비즈노 후보 검색 → 국세청 상태 검증
+        Step 3  [통합]  PipelineResult 조립
+        Step 4  [신뢰도] conf_FINAL 주입
     """
-    # List 입력 대응 (인터페이스는 다중 뷰 확장 가능 구조 유지)
     if isinstance(image_source, list):
         source = image_source[0]
     else:
@@ -142,32 +105,24 @@ def run_pipeline(image_source: str | list[str]) -> dict:
     if not extraction.is_extractable():
         logger.warning("[Step 1] 상호명 인식 실패 — 조기 종료.")
         from schemas.output_schema import PipelineResult
-        result = PipelineResult(
+        result_obj = PipelineResult(
             image_source=source,
             status=PipelineStatus.NOT_FOUND,
             source_signboard=extraction,
             warnings=["간판에서 상호명을 인식할 수 없습니다."],
         )
-        return _inject_confidence(result.model_dump(mode="json"))
+        return _inject_confidence(result_obj.model_dump(mode="json"))
 
-    # ── Step 2: GPS 좌표 추출 ─────────────────────────────────────────────────
-    logger.info("[Step 2] GPS EXIF 추출 중...")
-    gps_lat, gps_lon = _extract_gps(source)
-
-    # ── Step 3 & 4: MCP 에이전트 ─────────────────────────────────────────────
-    logger.info("[Step 3-4] MCP 에이전트 실행 중...")
+    # ── Step 2: MCP 에이전트 ─────────────────────────────────────────────────
+    logger.info("[Step 2] MCP 에이전트 실행 중...")
     agent_output = run_verification_agent(extraction)
 
-    # ── Step 5: 최종 통합 (GPS 가산점 반영) ──────────────────────────────────
-    logger.info("[Step 5] 결과 통합 중...")
-    pipeline_result = build_pipeline_result(
-        source, extraction, agent_output,
-        gps_lat=gps_lat,
-        gps_lon=gps_lon,
-    )
+    # ── Step 3: 최종 통합 ────────────────────────────────────────────────────
+    logger.info("[Step 3] 결과 통합 중...")
+    pipeline_result = build_pipeline_result(source, extraction, agent_output)
     result = pipeline_result.model_dump(mode="json")
 
-    # ── Step 6: 신뢰도 수식 계산 ──────────────────────────────────────────────
+    # ── Step 4: 신뢰도 수식 ───────────────────────────────────────────────────
     result = _inject_confidence(result)
 
     logger.info("=" * 60)

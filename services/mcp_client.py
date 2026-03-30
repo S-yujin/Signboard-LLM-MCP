@@ -3,10 +3,12 @@ services/mcp_client.py
 
 MCP Tool 정의 + 실제 외부 API 호출 디스패처.
 
-세 개의 MCP 도구:
+두 개의 MCP 도구:
   1. bizno_search_candidates    — 비즈노 API (bizno.net/api/fapi) 상호명 검색
-  2. bizno_search_by_phone      — 비즈노 API 전화번호 직접 검색 (Layer 2)
-  3. nts_verify_business_status — 국세청 API 사업자 상태 최종 검증
+  2. nts_verify_business_status — 국세청 API 사업자 상태 최종 검증
+
+※ 전화번호 검색(bizno_search_by_phone)은 제거됨.
+   전화번호는 LLM 추출 결과에 포함되지만 비즈노 검색에는 사용하지 않습니다.
 """
 import json
 from typing import Any
@@ -47,25 +49,6 @@ MCP_TOOLS: list[dict] = [
         },
     },
     {
-        "name": "bizno_search_by_phone",
-        "description": (
-            "비즈노(bizno.net) API로 전화번호를 검색하여 사업자를 직접 조회합니다. "
-            "상호명 변형 fallback으로 0건이 반환될 때, "
-            "간판에서 추출한 전화번호(phone)가 있으면 이 도구를 호출하세요. "
-            "전화번호가 정확히 등록된 경우 상호명과 무관하게 정확한 사업자를 반환합니다."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "phone": {
-                    "type": "string",
-                    "description": "검색할 전화번호 (하이픈 포함/제거 모두 가능, 예: '051-817-9233')",
-                },
-            },
-            "required": ["phone"],
-        },
-    },
-    {
         "name": "nts_verify_business_status",
         "description": (
             "국세청 공공데이터 API로 사업자등록번호 배열의 상태를 최종 검증합니다. "
@@ -95,8 +78,6 @@ MCP_TOOLS: list[dict] = [
 def dispatch_tool(tool_name: str, tool_input: dict) -> str:
     if tool_name == "bizno_search_candidates":
         result = _bizno_search_candidates(**tool_input)
-    elif tool_name == "bizno_search_by_phone":
-        result = _bizno_search_by_phone(**tool_input)
     elif tool_name == "nts_verify_business_status":
         result = _nts_verify_business_status(**tool_input)
     else:
@@ -194,118 +175,6 @@ def _bizno_single_request(query: str, area: str | None = None) -> dict:
     except httpx.HTTPError as e:
         logger.error("[MCP/비즈노] API 오류: %s", e)
         return {"error": str(e), "candidates": [], "source": "bizno_api"}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Tool 2: 비즈노 전화번호 검색 (Layer 2 — 상호명 fallback 소진 시 사용)
-# gb=4: 전화번호 검색 모드
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _bizno_search_by_phone(phone: str) -> dict:
-    """
-    비즈노 API로 전화번호를 직접 검색합니다.
-
-    사용 시점:
-        - bizno_search_candidates fallback 쿼리가 모두 소진되어 0건인 경우
-        - 간판 이미지에서 전화번호가 추출된 경우
-
-    전처리:
-        - 하이픈, 공백 제거 후 검색 (API는 숫자만 받음)
-        - 지역번호 0 제거 후 재시도 (051-xxx → 51-xxx 형태 일부 API 허용)
-
-    응답:
-        - 성공: candidates 포함 (정규화 포맷 동일)
-        - 실패: candidates: [], phone_not_found: True
-    """
-    logger.info("[MCP/비즈노/전화] 검색: %s", phone)
-
-    if not settings.BIZNO_API_KEY:
-        logger.debug("[MCP/비즈노/전화] API 키 없음 — mock 반환")
-        return _bizno_phone_mock(phone)
-
-    # 전화번호 정규화: 숫자만 추출
-    digits = "".join(c for c in phone if c.isdigit())
-    # 하이픈 포함 포맷도 시도 (일부 API 구현이 하이픈 포함을 기대)
-    formatted = _format_phone(digits)
-
-    queries_to_try = [formatted, digits]
-    # 지역번호 0 제거 변형 (051-xxx → 51-xxx)
-    if digits.startswith("0"):
-        alt = digits[1:]
-        queries_to_try.append(_format_phone(alt))
-        queries_to_try.append(alt)
-
-    for q in queries_to_try:
-        result = _bizno_phone_single_request(q)
-        candidates = result.get("candidates", [])
-        if candidates:
-            logger.info("[MCP/비즈노/전화] 히트: '%s' → %d건", q, len(candidates))
-            result["phone_query"] = q
-            return result
-        if "error" in result:
-            logger.warning("[MCP/비즈노/전화] 오류: %s", result["error"])
-
-    logger.warning("[MCP/비즈노/전화] 전화번호 검색 0건: %s", phone)
-    return {"candidates": [], "total": 0, "source": "bizno_api", "phone_not_found": True}
-
-
-def _bizno_phone_single_request(phone_query: str) -> dict:
-    """비즈노 전화번호 단건 요청 (gb=4)."""
-    params = {
-        "key":     settings.BIZNO_API_KEY,
-        "q":       phone_query,
-        "gb":      "4",          # 전화번호 검색 모드
-        "type":    "json",
-        "status":  "Y",
-        "pagecnt": "5",
-    }
-    try:
-        resp = httpx.get(settings.BIZNO_API_URL, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if not isinstance(data, dict):
-            return {"error": "잘못된 응답 형식", "candidates": []}
-
-        if data.get("resultCode") != 0:
-            return {"error": data.get("resultMsg", "알 수 없는 오류"), "candidates": []}
-
-        raw_items = data.get("items") or []
-        candidates = [_normalize_bizno_item(item) for item in raw_items if isinstance(item, dict)]
-        return {"candidates": candidates, "total": data.get("totalCount", len(candidates)), "source": "bizno_api"}
-
-    except httpx.HTTPError as e:
-        logger.error("[MCP/비즈노/전화] API 오류: %s", e)
-        return {"error": str(e), "candidates": []}
-
-
-def _format_phone(digits: str) -> str:
-    """숫자열을 하이픈 포함 전화번호 포맷으로 변환. 예: '0518179233' → '051-817-9233'"""
-    if len(digits) == 10 and digits.startswith("0"):
-        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
-    if len(digits) == 11 and digits.startswith("01"):
-        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
-    return digits  # 변환 불가 → 원본 반환
-
-
-def _bizno_phone_mock(phone: str) -> dict:
-    return {
-        "candidates": [
-            {
-                "registration_number": "9876543210",
-                "business_name":       f"(전화검색) {phone}",
-                "business_status":     "계속사업자",
-                "status_code":         "01",
-                "tax_type":            "일반과세자",
-                "tax_type_cd":         "1",
-                "corporation_number":  "",
-                "end_date":            "",
-                "source":              "mock_phone",
-            }
-        ],
-        "total": 1,
-        "source": "mock_phone",
-    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
