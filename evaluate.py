@@ -23,7 +23,7 @@ import time
 import re
 import html
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from app import run_pipeline
 from config import settings
@@ -36,11 +36,6 @@ from services.confidence import (
     W_EXT, W_LLM, W_MCP,
     W_BRAND, W_BRANCH, W_STATUS,
 )
-
-# 제안 수식 가중치 (논문 수식)
-_W_EXT = W_EXT    # conf_EXT: LLM 1차 추출 기본 신뢰도
-_W_LLM = W_LLM    # conf_LLM: 문맥 타당성 (속성 완성도 + 확률적 융합)
-_W_MCP = W_MCP    # conf_MCP: 비즈노/국세청 외부 DB 일치 점수
 from utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -64,24 +59,25 @@ class EvalRecord:
     extracted_industry: str = ""
     extracted_address: str = ""
 
-    # ── 제안 수식 (논문): 3항 신뢰도 ─────────────────────────────────────────
-    # conf_FINAL = w_EXT*conf_EXT + w_LLM*conf_LLM + w_MCP*conf_MCP
-    conf_ext: float = 0.0          # LLM 1차 추출 기본 신뢰도 (VLM confidence)
-    conf_llm: float = 0.0          # 문맥 타당성 (속성 완성도 + probabilistic fusion)
-    conf_mcp: float = 0.0          # 외부 DB 일치 점수 (비즈노/국세청)
-    conf_final: float = 0.0        # confFINAL (제안 수식)
-    raw_levenshtein_similarity: float = 0.0
-    probabilistic_fusion_score: float = 0.0
-    attribute_completeness: float = 0.0
-
-    # ── Baseline 수식 (기존 v2): S_brand + S_branch + S_status ───────────────
+    # ── 제안 수식 v2: 3항 신뢰도 ─────────────────────────────────────────────
+    # conf_FINAL = w_BRAND*S_brand + w_BRANCH*S_branch + w_STATUS*S_status
     s_brand:  float = 0.0          # 브랜드명 Jaro-Winkler 유사도
     s_branch: float = 0.0          # 지점명 일치 점수 (None이면 0으로 저장)
     s_branch_active: bool = True   # S_branch 항 활성 여부
     s_status: float = 0.0          # 국세청 상태 점수
-    conf_final_baseline: float = 0.0  # confFINAL (Baseline v2 수식)
+    conf_final: float = 0.0        # confFINAL (제안 수식)
     jaro_winkler_raw: float = 0.0  # 정규화 전 Jaro-Winkler (디버그)
-    precision_gain: float = 0.0    # conf_final(제안) − conf_final_baseline
+
+    # ── Baseline 수식: 기존 2항 (MUM + LLM) ──────────────────────────────────
+    # confFINAL_baseline = 0.5 * conf_MUM + 0.5 * conf_LLM
+    conf_ext: float = 0.0
+    conf_llm: float = 0.0
+    conf_mcp: float = 0.0
+    conf_final_baseline: float = 0.0
+    raw_levenshtein_similarity: float = 0.0
+    probabilistic_fusion_score: float = 0.0
+    attribute_completeness: float = 0.0
+    precision_gain: float = 0.0    # conf_final − conf_final_baseline
 
     # ── 파이프라인 결과 ───────────────────────────────────────────────────────
     pipeline_status: str = ""
@@ -104,46 +100,16 @@ class EvalRecord:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Baseline 신뢰도 (기존 수식: w_MUM*conf_MUM + w_LLM*conf_LLM)
+# Baseline 신뢰도 (기존 2항 수식: MUM + LLM)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _compute_baseline_confidence(conf_mum: float, conf_llm: float) -> float:
     """
     기존 소스 논문 수식 (2항):
-        confFINAL_baseline = w_MUM * conf_MUM + w_LLM * conf_LLM
-                           = 0.5 * conf_MUM + 0.5 * conf_LLM
-
-    conf_MUM: MUM/BERT 계열 추출 모델의 신뢰도 → 여기서는 conf_EXT(VLM 추출 기본 신뢰도)로 대응
-    conf_LLM: LLM 검증자의 문맥 타당성 점수 → probabilistic_fusion 기반 conf_LLM으로 대응
-    MCP(외부 API 검증) 항이 없는 것이 Baseline과 제안 수식의 핵심 차이.
+        confFINAL_baseline = 0.5 * conf_MUM + 0.5 * conf_LLM
+    MCP(외부 검증) 항이 없어 API 연동 이전 상태를 대표합니다.
     """
     return 0.5 * conf_mum + 0.5 * conf_llm
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 제안 수식 신뢰도 (논문 3항: w_EXT*conf_EXT + w_LLM*conf_LLM + w_MCP*conf_MCP)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _compute_proposed_confidence(
-    conf_ext: float,
-    conf_llm: float,
-    conf_mcp: float,
-) -> float:
-    """
-    논문 제안 수식 (3항):
-        conf_FINAL = w_EXT * conf_EXT + w_LLM * conf_LLM + w_MCP * conf_MCP
-
-    conf_EXT: LLM/VLM이 이미지에서 정보를 1차 추출할 때의 기본 신뢰도
-    conf_LLM: 추출된 정보의 문맥적 타당성을 LLM이 내부적으로 평가한 점수
-              (속성 완성도 + probabilistic_fusion 기반)
-    conf_MCP: 국세청/Bizno.net 실제 사업자 데이터와 추출 데이터 간의 일치 점수
-    """
-    total_w = _W_EXT + _W_LLM + _W_MCP
-    w_ext = _W_EXT / total_w
-    w_llm = _W_LLM / total_w
-    w_mcp = _W_MCP / total_w
-    result = w_ext * conf_ext + w_llm * conf_llm + w_mcp * conf_mcp
-    return round(max(0.0, min(1.0, result)), 4)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -227,37 +193,7 @@ def evaluate_one(image_path: str, delay_sec: int = DEFAULT_DELAY_SEC) -> EvalRec
                 rec.best_confidence   = best.get("confidence_score", 0.0)
                 rec.status_verified   = best.get("status_verified", False)
 
-            # ── 제안 수식 (논문): w_EXT*conf_EXT + w_LLM*conf_LLM + w_MCP*conf_MCP
-            completeness = _attribute_completeness(sb)
-            conf_ext_raw = (sb.get("confidence") or {}).get("business_name", 0.0)
-
-            proposed_inp = ConfidenceInput(
-                conf_ext               = conf_ext_raw,
-                extracted_name         = rec.extracted_name,
-                candidate_name         = rec.best_match_name,
-                attribute_completeness = completeness,
-                conf_mcp               = rec.best_confidence,
-            )
-            proposed_res = compute_confidence(proposed_inp)
-
-            rec.conf_ext                   = proposed_res.conf_ext
-            rec.conf_llm                   = proposed_res.conf_llm   # 문맥 타당성 (속성 완성도 + probabilistic fusion)
-            rec.conf_mcp                   = proposed_res.conf_mcp   # 비즈노/국세청 외부 DB 일치 점수
-            rec.raw_levenshtein_similarity  = proposed_res.raw_levenshtein_similarity
-            rec.probabilistic_fusion_score  = proposed_res.probabilistic_fusion_score
-            rec.attribute_completeness     = proposed_res.attribute_completeness
-
-            # 제안 수식 최종값: w_EXT*conf_EXT + w_LLM*conf_LLM + w_MCP*conf_MCP
-            rec.conf_final = _compute_proposed_confidence(
-                conf_ext = rec.conf_ext,
-                conf_llm = rec.conf_llm,
-                conf_mcp = rec.conf_mcp,
-            )
-
-            # ── Baseline (기존 수식): w_MUM*conf_MUM + w_LLM*conf_LLM ──────
-            # conf_MUM → conf_EXT로 대응 (MUM/BERT 계열 추출 신뢰도)
-            # conf_LLM → LLM 문맥 타당성 점수 (동일)
-            # MCP 항 없음이 Baseline과의 핵심 차이
+            # ── 제안 수식 v2: S_brand + S_branch + S_status ───────────────
             v2_inp = ConfidenceInputV2(
                 extracted_name  = rec.extracted_name,
                 candidate_name  = rec.best_match_name,
@@ -270,12 +206,32 @@ def evaluate_one(image_path: str, delay_sec: int = DEFAULT_DELAY_SEC) -> EvalRec
             rec.s_branch         = v2_res.s_branch if v2_res.s_branch is not None else 0.0
             rec.s_branch_active  = v2_res.s_branch is not None
             rec.s_status         = v2_res.s_status
+            rec.conf_final       = v2_res.conf_final
             rec.jaro_winkler_raw = v2_res.jaro_winkler_raw
 
-            # Baseline = w_MUM*conf_MUM + w_LLM*conf_LLM (MCP 항 없음)
+            # ── Baseline 수식: conf_EXT + conf_LLM ────────────────────────
+            completeness  = _attribute_completeness(sb)
+            conf_ext_raw  = (sb.get("confidence") or {}).get("business_name", 0.0)
+
+            old_inp = ConfidenceInput(
+                conf_ext              = conf_ext_raw,
+                extracted_name        = rec.extracted_name,
+                candidate_name        = rec.best_match_name,
+                attribute_completeness= completeness,
+                conf_mcp              = rec.best_confidence,
+            )
+            old_res = compute_confidence(old_inp)
+
+            rec.conf_ext                  = old_res.conf_ext
+            rec.conf_llm                  = old_res.conf_llm
+            rec.conf_mcp                  = old_res.conf_mcp
+            rec.raw_levenshtein_similarity = old_res.raw_levenshtein_similarity
+            rec.probabilistic_fusion_score = old_res.probabilistic_fusion_score
+            rec.attribute_completeness    = old_res.attribute_completeness
+
             rec.conf_final_baseline = _compute_baseline_confidence(
-                conf_mum = rec.conf_ext,
-                conf_llm = rec.conf_llm,
+                conf_mum=rec.conf_ext,
+                conf_llm=rec.conf_llm,
             )
             rec.precision_gain = round(rec.conf_final - rec.conf_final_baseline, 4)
 
@@ -383,9 +339,8 @@ def _print_record(rec: EvalRecord) -> None:
 
     print(
         f"  {icon}{hall_str}{supp_str} 추출: {rec.extracted_name or '(실패)':<20}"
-        f" | confFINAL(제안): {rec.conf_final:.4f}"
-        f"  [EXT={rec.conf_ext:.3f} LLM={rec.conf_llm:.3f} MCP={rec.conf_mcp:.3f}]"
-        f"  (Baseline: {rec.conf_final_baseline:.4f}, Δ{rec.precision_gain:+.4f})"
+        f" | confFINAL: {rec.conf_final:.4f}"
+        f"  (base: {rec.conf_final_baseline:.4f}, Δ{rec.precision_gain:+.4f})"
         f" | {rec.elapsed_sec}s{retry_str}"
     )
     if rec.error_msg:
@@ -443,15 +398,6 @@ def _print_summary(records: list[EvalRecord]) -> None:
     print(f"  {'':32} {'Baseline':>10}  {'제안':>10}  {'향상(Δ)':>10}")
     print(f"  {'confFINAL (평균)':32} {avg_base:>10.4f}  {avg_conf:>10.4f}  {avg_gain:>+10.4f}")
     print()
-    print(f"  ── 제안 수식 항별 평균 (w_EXT={_W_EXT:.2f} / w_LLM={_W_LLM:.2f} / w_MCP={_W_MCP:.2f}) ──")
-    avg_conf_ext = sum(r.conf_ext for r in records) / total
-    avg_conf_llm = sum(r.conf_llm for r in records) / total
-    avg_conf_mcp = sum(r.conf_mcp for r in records) / total
-    print(f"  conf_EXT (VLM 1차 추출 신뢰도)     평균: {avg_conf_ext:.4f}")
-    print(f"  conf_LLM (문맥 타당성)              평균: {avg_conf_llm:.4f}")
-    print(f"  conf_MCP (비즈노/국세청 일치 점수)  평균: {avg_conf_mcp:.4f}")
-    print()
-    print(f"  ── Baseline 항별 평균 (S_brand/branch/status) ──────────────────")
     print(f"  S_brand  (Jaro-Winkler, w={W_BRAND:.2f})  평균: {avg_sbrand:.4f}")
     sbranch_str = f"{avg_sbranch:.4f}" if not (avg_sbranch != avg_sbranch) else "N/A (지점명 없음)"
     print(f"  S_branch (지점명 일치, w={W_BRANCH:.2f})  평균: {sbranch_str}"
@@ -473,15 +419,13 @@ def _print_summary(records: list[EvalRecord]) -> None:
 _MAIN_FIELDS = [
     "image_file",
     "extracted_name", "extracted_phone", "extracted_industry", "extracted_address",
-    # 제안 수식 (논문): w_EXT*conf_EXT + w_LLM*conf_LLM + w_MCP*conf_MCP
+    # 제안 수식 v2
+    "s_brand", "s_branch", "s_branch_active", "s_status", "conf_final",
+    "jaro_winkler_raw",
+    # baseline 비교
     "conf_ext", "conf_llm", "conf_mcp",
     "raw_levenshtein_similarity", "probabilistic_fusion_score", "attribute_completeness",
-    "conf_final",
-    # Baseline: w_MUM*conf_MUM + w_LLM*conf_LLM (S_brand+S_branch+S_status)
-    "s_brand", "s_branch", "s_branch_active", "s_status",
-    "jaro_winkler_raw",
-    "conf_final_baseline",
-    "precision_gain",
+    "conf_final_baseline", "precision_gain",
     # 파이프라인
     "pipeline_status", "candidate_count",
     "best_match_name", "best_match_regno", "best_match_status",
@@ -507,13 +451,14 @@ def _save_ablation_csv(records: list[EvalRecord], path: str) -> None:
     ablation_fields = [
         "image_file",
         "extracted_name", "best_match_name",
-        # 제안 수식 3항 (논문)
-        "conf_ext", "conf_llm", "conf_mcp",
-        "conf_final",           # 제안 수식 결과
-        # baseline (기존 수식: S_brand+S_branch+S_status)
+        # 제안 수식 3항
         "s_brand", "s_branch", "s_branch_active", "s_status",
+        "conf_final",           # 제안 수식 결과
+        "jaro_winkler_raw",
+        # baseline
+        "conf_ext", "conf_llm",
         "conf_final_baseline",  # 기존 수식 결과
-        "precision_gain",       # 향상도 Δ (제안 - baseline)
+        "precision_gain",       # 향상도 Δ
         # 검증 상태
         "is_hallucination", "hallucination_suppressed",
         "pipeline_status", "status_verified",
@@ -578,14 +523,13 @@ def _save_html_report(records: list[EvalRecord], path: str) -> None:
     포함 테이블:
         Table 1 — 이미지별 상세 결과 (제안 수식 3항 + confFINAL)
         Table 2 — Ablation Study: Baseline vs 제안 수식
-        Table 3 — 요약 통계 (논문 결과 섹션용)
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     total = len(records)
     if total == 0:
         return
 
-    # ── 요약 통계 계산 ────────────────────────────────────────────────────────
+    # ── 기초 통계 계산 ────────────────────────────────────────────────────────
     verified  = sum(1 for r in records if r.pipeline_status == "verified")
     partial   = sum(1 for r in records if r.pipeline_status == "partial")
     not_found = sum(1 for r in records if r.pipeline_status == "not_found")
@@ -594,37 +538,72 @@ def _save_html_report(records: list[EvalRecord], path: str) -> None:
     nts_verified = sum(1 for r in records if r.status_verified)
 
     avg = lambda attr: sum(getattr(r, attr) for r in records) / total
-    avg_conf  = avg("conf_final")
-    avg_base  = avg("conf_final_baseline")
-    avg_gain  = avg("precision_gain")
-    avg_sbrand  = avg("s_brand")
-    avg_sstat   = avg("s_status")
-    avg_jw      = avg("jaro_winkler_raw")
-    avg_time    = avg("elapsed_sec")
+    avg_conf     = avg("conf_final")
+    avg_base     = avg("conf_final_baseline")
+    avg_gain     = avg("precision_gain")
+    avg_sbrand   = avg("s_brand")
+    avg_sstat    = avg("s_status")
+    avg_jw       = avg("jaro_winkler_raw")
+    avg_time     = avg("elapsed_sec")
+    avg_conf_ext = avg("conf_ext")
+    avg_conf_llm = avg("conf_llm")
 
     active_branch = [r for r in records if r.s_branch_active]
     avg_sbranch = (
         sum(r.s_branch for r in active_branch) / len(active_branch)
         if active_branch else None
     )
+    sbranch_avg_str = f"{avg_sbranch:.4f}" if avg_sbranch is not None else "N/A"
 
     total_hall = sum(1 for r in records if r.is_hallucination)
     supp_hall  = sum(1 for r in records if r.hallucination_suppressed)
 
-    # ── Table 1 행 생성 (제안 수식: conf_EXT / conf_LLM / conf_MCP / conf_final) ──
+    # ── Precision / Recall / F1 ───────────────────────────────────────────────
+    tp = verified + partial
+    fp = not_found
+    fn = total - tp - fp
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1_score  = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0 else 0.0
+    )
+
+    # ── Precision / Recall / F1 카드 ─────────────────────────────────────────
+    metrics_cards = f"""  <div class="stat-card" style="border-color:#e67e22">
+    <div class="label">Precision (정밀도)</div>
+    <div class="value">{precision:.4f}</div>
+    <div class="sub">TP / (TP + FP)</div>
+  </div>
+  <div class="stat-card" style="border-color:#e67e22">
+    <div class="label">Recall (재현율)</div>
+    <div class="value">{recall:.4f}</div>
+    <div class="sub">TP / (TP + FN)</div>
+  </div>
+  <div class="stat-card" style="border-color:#d35400">
+    <div class="label">F1-Score</div>
+    <div class="value" style="color:#d35400">{f1_score:.4f}</div>
+    <div class="sub">Harmonic Mean</div>
+  </div>"""
+
+    # ── Table 1 행 생성 ───────────────────────────────────────────────────────
     rows_t1 = []
     for i, r in enumerate(records, 1):
         hall_icon = "🔴" if r.is_hallucination else ""
         supp_icon = "✓" if r.hallucination_suppressed else ""
+        branch_str = (
+            f"{r.s_branch:.4f}" if r.s_branch_active else
+            '<span style="color:#aaa;font-size:0.82em">N/A</span>'
+        )
         rows_t1.append(
             f"<tr>"
             f"<td style='text-align:center'>{i}</td>"
             f"<td>{html.escape(r.image_file)}</td>"
             f"<td>{html.escape(r.extracted_name or '—')}</td>"
             f"<td>{html.escape(r.best_match_name or '—')}</td>"
-            f"<td style='text-align:center'>{r.conf_ext:.4f}</td>"
-            f"<td style='text-align:center'>{r.conf_llm:.4f}</td>"
-            f"<td>{_score_bar(r.conf_mcp, color='#27ae60')}</td>"
+            f"<td>{_score_bar(r.s_brand, color='#2980b9')}</td>"
+            f"<td style='text-align:center'>{branch_str}</td>"
+            f"<td>{_score_bar(r.s_status, color='#8e44ad')}</td>"
             f"<td>{_score_bar(r.conf_final, color='#16a085')}</td>"
             f"<td>{_status_badge(r.pipeline_status)}</td>"
             f"<td style='text-align:center'>{'✓' if r.status_verified else '—'}</td>"
@@ -633,42 +612,35 @@ def _save_html_report(records: list[EvalRecord], path: str) -> None:
             f"</tr>"
         )
 
-    # ── Table 2 행 생성 (Ablation: Baseline(S_brand+branch+status) vs 제안(EXT+LLM+MCP)) ──
+    # ── Table 2 행 생성 (Ablation) ────────────────────────────────────────────
     rows_t2 = []
     for i, r in enumerate(records, 1):
-        branch_str = f"{r.s_branch:.4f}" if r.s_branch_active else "N/A"
         rows_t2.append(
             f"<tr>"
             f"<td style='text-align:center'>{i}</td>"
             f"<td>{html.escape(r.image_file)}</td>"
             f"<td>{html.escape(r.extracted_name or '—')}</td>"
-            f"<td style='text-align:center'>{r.s_brand:.4f}</td>"
-            f"<td style='text-align:center'>{branch_str}</td>"
-            f"<td style='text-align:center'>{r.s_status:.4f}</td>"
-            f"<td style='text-align:center;font-weight:600'>{r.conf_final_baseline:.4f}</td>"
             f"<td style='text-align:center'>{r.conf_ext:.4f}</td>"
             f"<td style='text-align:center'>{r.conf_llm:.4f}</td>"
-            f"<td style='text-align:center'>{r.conf_mcp:.4f}</td>"
+            f"<td style='text-align:center;font-weight:600'>{r.conf_final_baseline:.4f}</td>"
+            f"<td style='text-align:center'>{r.s_brand:.4f}</td>"
+            f"<td style='text-align:center'>{'N/A' if not r.s_branch_active else f'{r.s_branch:.4f}'}</td>"
+            f"<td style='text-align:center'>{r.s_status:.4f}</td>"
             f"<td style='text-align:center;font-weight:600'>{r.conf_final:.4f}</td>"
             + _gain_cell(r.precision_gain)
             + f"</tr>"
         )
 
     # ── 평균 행 (Table 2 footer) ──────────────────────────────────────────────
-    sbranch_avg_str = f"{avg_sbranch:.4f}" if avg_sbranch is not None else "N/A"
-    avg_conf_ext = avg("conf_ext")
-    avg_conf_llm = avg("conf_llm")
-    avg_conf_mcp = avg("conf_mcp")
     footer_t2 = (
         f"<tr style='background:#eaf4fb;font-weight:700'>"
         f"<td colspan='3' style='text-align:right'>평균 (Mean)</td>"
+        f"<td style='text-align:center'>{avg_conf_ext:.4f}</td>"
+        f"<td style='text-align:center'>{avg_conf_llm:.4f}</td>"
+        f"<td style='text-align:center'>{avg_base:.4f}</td>"
         f"<td style='text-align:center'>{avg_sbrand:.4f}</td>"
         f"<td style='text-align:center'>{sbranch_avg_str}</td>"
         f"<td style='text-align:center'>{avg_sstat:.4f}</td>"
-        f"<td style='text-align:center'>{avg_base:.4f}</td>"
-        f"<td style='text-align:center'>{avg_conf_ext:.4f}</td>"
-        f"<td style='text-align:center'>{avg_conf_llm:.4f}</td>"
-        f"<td style='text-align:center'>{avg_conf_mcp:.4f}</td>"
         f"<td style='text-align:center'>{avg_conf:.4f}</td>"
         + _gain_cell(avg_gain)
         + f"</tr>"
@@ -738,16 +710,10 @@ def _save_html_report(records: list[EvalRecord], path: str) -> None:
 </div>
 
 <div class="formula">
-  <strong>[제안 수식]</strong> &nbsp;
-  conf_FINAL = <strong>w<sub>EXT</sub></strong> &times; conf_EXT
-             + <strong>w<sub>LLM</sub></strong> &times; conf_LLM
-             + <strong>w<sub>MCP</sub></strong> &times; conf_MCP
-  &nbsp;&nbsp; (w = {_W_EXT:.2f} / {_W_LLM:.2f} / {_W_MCP:.2f})
-  <br>
-  <span style="color:#7f8c8d;font-size:0.9em">
-  [Baseline] conf_FINAL = 0.5 &times; conf_MUM + 0.5 &times; conf_LLM
-  &nbsp;(S_brand + S_branch + S_status, MCP 항 없음)
-  </span>
+  conf_FINAL = <strong>w<sub>BRAND</sub></strong> &times; S_brand
+             + <strong>w<sub>BRANCH</sub></strong> &times; S_branch
+             + <strong>w<sub>STATUS</sub></strong> &times; S_status
+  &nbsp;&nbsp; (w = {W_BRAND:.2f} / {W_BRANCH:.2f} / {W_STATUS:.2f})
 </div>
 
 <!-- ─── 요약 카드 ──────────────────────────────────────────────────────── -->
@@ -774,29 +740,29 @@ def _save_html_report(records: list[EvalRecord], path: str) -> None:
     <div class="sub">Baseline {avg_base:.4f} &nbsp; Δ<span class="highlight">+{avg_gain:.4f}</span></div>
   </div>
   <div class="stat-card" style="border-color:#2980b9">
-    <div class="label">평균 conf_EXT (VLM 추출)</div>
-    <div class="value">{sum(r.conf_ext for r in records)/total:.4f}</div>
-    <div class="sub">LLM/VLM 1차 추출 기본 신뢰도</div>
+    <div class="label">평균 S_brand (JW)</div>
+    <div class="value">{avg_sbrand:.4f}</div>
+    <div class="sub">Jaro-Winkler raw {avg_jw:.4f}</div>
   </div>
   <div class="stat-card" style="border-color:#8e44ad">
-    <div class="label">평균 conf_MCP (외부 DB)</div>
-    <div class="value">{sum(r.conf_mcp for r in records)/total:.4f}</div>
-    <div class="sub">비즈노 / 국세청 일치 점수</div>
+    <div class="label">평균 S_status</div>
+    <div class="value">{avg_sstat:.4f}</div>
+    <div class="sub">국세청 검증 상태 점수</div>
   </div>
   <div class="stat-card" style="border-color:#e74c3c">
     <div class="label">Hallucination 억제</div>
     <div class="value">{supp_hall} / {total_hall}</div>
     <div class="sub">의심 {total_hall}건 중 {supp_hall}건 MCP 억제</div>
   </div>
+{metrics_cards}
 </div>
 
 <!-- ─── Table 1: 이미지별 상세 결과 ────────────────────────────────────── -->
-<h2>Table 1 &nbsp; 이미지별 상세 실험 결과 (제안 수식)</h2>
-<p class="note">
-  conf_EXT: VLM 1차 추출 기본 신뢰도 &nbsp;|&nbsp;
-  conf_LLM: 문맥 타당성 (속성 완성도 + probabilistic fusion) &nbsp;|&nbsp;
-  conf_MCP: 비즈노/국세청 외부 DB 일치 점수 &nbsp;|&nbsp;
-  H: Hallucination 의심(🔴) / MCP 억제(✓)</p>
+<h2>Table 1 &nbsp; 이미지별 상세 실험 결과</h2>
+<p class="note">S_brand: 브랜드 Jaro-Winkler 유사도 &nbsp;|&nbsp;
+  S_branch: 지점명 일치 점수 (N/A = 지점명 없어 비활성) &nbsp;|&nbsp;
+  S_status: 국세청 상태 점수 &nbsp;|&nbsp;
+  H: Hallucination 의심(🔴) / 억제(✓)</p>
 <table>
 <thead>
 <tr>
@@ -804,10 +770,10 @@ def _save_html_report(records: list[EvalRecord], path: str) -> None:
   <th>이미지</th>
   <th>추출 상호명</th>
   <th>비즈노 매칭명</th>
-  <th>conf_EXT</th>
-  <th>conf_LLM</th>
-  <th>conf_MCP</th>
-  <th>confFINAL<br><small>제안</small></th>
+  <th>S_brand</th>
+  <th>S_branch</th>
+  <th>S_status</th>
+  <th>confFINAL</th>
   <th>상태</th>
   <th>NTS</th>
   <th>H</th>
@@ -822,8 +788,8 @@ def _save_html_report(records: list[EvalRecord], path: str) -> None:
 <!-- ─── Table 2: Ablation Study ─────────────────────────────────────────── -->
 <h2>Table 2 &nbsp; Ablation Study — Baseline vs 제안 수식</h2>
 <p class="note">
-  Baseline: conf_FINAL = 0.5&times;conf_MUM + 0.5&times;conf_LLM &nbsp;(S_brand+S_branch+S_status, MCP 항 없음)<br>
-  제안: conf_FINAL = {_W_EXT}&times;conf_EXT + {_W_LLM}&times;conf_LLM + {_W_MCP}&times;conf_MCP
+  Baseline: conf_FINAL<sub>base</sub> = 0.5&times;conf_EXT + 0.5&times;conf_LLM &nbsp;|&nbsp;
+  제안: conf_FINAL = {W_BRAND}&times;S_brand + {W_BRANCH}&times;S_branch + {W_STATUS}&times;S_status
 </p>
 <table>
 <thead>
@@ -831,18 +797,17 @@ def _save_html_report(records: list[EvalRecord], path: str) -> None:
   <th rowspan="2">#</th>
   <th rowspan="2">이미지</th>
   <th rowspan="2">추출 상호명</th>
-  <th colspan="4" style="background:#7f8c8d">Baseline (2항 — MCP 없음)</th>
-  <th colspan="4" style="background:#16a085">제안 수식 (3항 — MCP 포함)</th>
+  <th colspan="3" style="background:#7f8c8d">Baseline (2항)</th>
+  <th colspan="4" style="background:#16a085">제안 수식 (3항)</th>
   <th rowspan="2">Δ gain</th>
 </tr>
 <tr>
-  <th style="background:#95a5a6">S_brand</th>
-  <th style="background:#95a5a6">S_branch</th>
-  <th style="background:#95a5a6">S_status</th>
+  <th style="background:#95a5a6">conf_EXT</th>
+  <th style="background:#95a5a6">conf_LLM</th>
   <th style="background:#95a5a6">confFINAL<br><small>baseline</small></th>
-  <th style="background:#1abc9c">conf_EXT</th>
-  <th style="background:#1abc9c">conf_LLM</th>
-  <th style="background:#1abc9c">conf_MCP</th>
+  <th style="background:#1abc9c">S_brand</th>
+  <th style="background:#1abc9c">S_branch</th>
+  <th style="background:#1abc9c">S_status</th>
   <th style="background:#1abc9c">confFINAL<br><small>제안</small></th>
 </tr>
 </thead>
